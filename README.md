@@ -1,10 +1,10 @@
 # What is MACH_BSD
 
 MACH_BSD kernel is part of the Bible OS Micro part of operating system for use in BibleOS operating systems. XNU is an acronym for X is Not Unix.
-XNU is a hybrid kernel combining the Mach kernel developed at Carnegie Mellon University with components from FreeBSD and a C++ API for writing drivers called IOKit.
-XNU runs on x86_64 and ARM64 for both single processor and multi-processor configurations.
+MACH_BSD is a hybrid kernel combining the Mach kernel developed at Carnegie Mellon University with components from FreeBSD and a C++ API for writing drivers called IOKit.
+MACH_BSD runs on x86_64 and ARM64 for both single processor and multi-processor configurations.
 
-## The XNU Source Tree
+## The MACH_BSD Source Tree
 
 * `config` - configurations for exported apis for supported architecture and platform
 * `SETUP` - Basic set of tools used for configuring the kernel, versioning and kextsymbol management.
@@ -28,7 +28,7 @@ The xnu make system can build kernel based on `KERNEL_CONFIGS` & `ARCH_CONFIGS` 
 Here is the syntax:
 
 ```text
-make INCLUDE_ROOT=include.framework(SOURCE DIR/BUILD/INCLUDE). arch=X86_64(obrigatory) KERNEL=RELEALESE
+make INCLUDE_ROOT=include.framework(SOURCE DIR/BUILD/INCLUDE). arch=X86_64(obrigatory) KERNEL=RELEALESE SOURCE DIR=.
 ```
 
 Where:
