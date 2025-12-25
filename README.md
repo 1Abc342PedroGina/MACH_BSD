@@ -1,4 +1,4 @@
-# What is MACH_BSD
+# What is MK_BSD
 
 MKBSD kernel is part of the Bible OS Micro part of operating system for use in BibleOS operating systems. MKBSD is an acronym for Mach KERNEL BSD
 MKBSD is a micro kernel combining the Mach kernel developed at Carnegie Mellon University with components from FreeBSD(and NETBSD) and a C++ API for writing drivers called IOKit.
@@ -20,11 +20,11 @@ MKBSD runs on x86_64 and ARM64 for both single processor and multi-processor con
 * `bsd` - BSD subsystems code
 * `tools` - A set of utilities for testing, debugging and profiling kernel.
 
-## How to Build XNU
+## How to Build MK_BSD
 
 ### Building a `DEVELOPMENT` Kernel
 
-The xnu make system can build kernel based on `KERNEL_CONFIGS` & `ARCH_CONFIGS` variables as arguments.
+The mkbsd make system can build kernel based on `KERNEL_CONFIGS` & `ARCH_CONFIGS` variables as arguments.
 Here is the syntax:
 
 ```text
