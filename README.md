@@ -1,6 +1,6 @@
-# What is XNU?
+# What is MACH_BSD
 
-XNU kernel is part of the Darwin operating system for use in macOS and iOS operating systems. XNU is an acronym for X is Not Unix.
+MACH_BSD kernel is part of the Bible OS Micro part of operating system for use in BibleOS operating systems. XNU is an acronym for X is Not Unix.
 XNU is a hybrid kernel combining the Mach kernel developed at Carnegie Mellon University with components from FreeBSD and a C++ API for writing drivers called IOKit.
 XNU runs on x86_64 and ARM64 for both single processor and multi-processor configurations.
 
@@ -28,7 +28,7 @@ The xnu make system can build kernel based on `KERNEL_CONFIGS` & `ARCH_CONFIGS` 
 Here is the syntax:
 
 ```text
-make SDKROOT=<sdkroot> ARCH_CONFIGS=<arch> KERNEL_CONFIGS=<variant>
+make INCLUDE_ROOT=include.framework(SOURCE DIR/BUILD/INCLUDE). arch=X86_64(obrigatory) KERNEL=RELEALESE
 ```
 
 Where:
@@ -40,7 +40,7 @@ Where:
 To build a kernel for the same architecture as running OS, just type
 
 ```text
-make SDKROOT=macosx.internal
+make in
 ```
 
 Additionally, there is support for configuring architectures through `ARCH_CONFIGS` and kernel configurations with `KERNEL_CONFIGS`.
@@ -52,7 +52,7 @@ make SDKROOT=macosx.internal ARCH_CONFIGS=X86_64 KERNEL_CONFIGS="RELEASE DEVELOP
 
 > Note: By default, the architecture is set to the build machine's architecture, and the default kernel config is set to build for `DEVELOPMENT`.
 
-This will also create a bootable image, kernel.[config],  and a kernel binary
+This will also create a bootable image, kernel,  and a kernel binary
 with symbols, kernel.[config].unstripped.
 
 To install the kernel into a DSTROOT, use the `install_kernels` target:
@@ -88,7 +88,7 @@ Remember to replace `DEVELOPMENT` and `ARM64` with the appropriate build and pla
     make KERNEL_CONFIGS=RELEASE SDKROOT=/path/to/SDK
     ```
 
-### Building FAT Kernel Binary
+### Building KERNEL FAT BIN
 
 Define architectures in your environment or when running a make command.
 
@@ -143,7 +143,7 @@ To build a kernelcache you can use the following mechanisms:
   So you can setup new kernel as
 
     ```text
-    cp BUILD/obj/DEVELOPMENT/X86_64/kernel.development /System/Library/Kernels/
+    cp BUILD/obj/DEVELOPMENT/X86_64/kernel /System/Library/Kernels/
     touch /System/Library/Extensions
     ps -e | grep kextd
     ```
