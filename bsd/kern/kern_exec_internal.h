@@ -76,6 +76,53 @@ __enum_decl(exec_security_mitigation_entitlement_t, uint8_t, {
  * starting with the SDK versions below.
  */
 	TPRO,
+#if HAS_MTE
+	CHECKED_ALLOCATIONS,
+/*
+ * For performance reasons, userland allocators are not required to tag pure data regions. This is
+ * mostly a libmalloc xzone concept, which has separated zones for pointer-containing vs pure-data
+ * allocations. We consider the former more "security-interesting" and therefore focus our
+ * protection on them. This allows to save on performance, although for certain processes we
+ * can swallow the trade-off (both in stability and perf) and enable the extra feature.
+ */
+	CHECKED_ALLOCATIONS_PURE_DATA,
+/*
+ * Certain first-party actors (such as WCP and BlastDoor) are modeled untrustworthy, and should never
+ * be allowed to receive untagged aliases to tagged memory from other actors. This entitlement (and a
+ *  corresponding hard-coded bundle ID list in AMFI, for secrecy) expresses this constraint.
+ */
+	CHECKED_ALLOCATIONS_NO_TAGGED_RECEIVE,
+/*
+ * First and third party processes may want to have a form of "soaking time" where their process
+ * is battle-tested with MTE without crashing on tag check faults. We call this mode soft-mode.
+ * Note that after the first tag check fault, tag checking is completely disabled on the process.
+ */
+	CHECKED_ALLOCATIONS_SOFT_MODE,
+#endif /* HAS_MTE */
+/*
+ * Guard objects.
+ *
+ * This mitigation indicates that userland and kernel VM allocations may not be replaced with guard
+ * objects on deallocation.
+ */
+	NO_GUARD_OBJECTS,
+});
+
+/*
+ * Version number for enhanced security
+ * Currently stored with 3 bits in `hardened_process_version`
+ */
+#define HARDENED_PROCESS_VERSION "com.apple.security.hardened-process.enhanced-security-version"
+
+__enum_decl(hardened_process_version_t, uint8_t, {
+	/* Not hardened process */
+	HARDENED_PROCESS_DISABLED = 0,
+	/* Initial version */
+	HARDENED_PROCESS_VERSION_ONE = 1,
+	/* Implies guard objects */
+	HARDENED_PROCESS_VERSION_TWO = 2,
+	/* Must be set to latest version */
+	HARDENED_PROCESS_VERSION_LATEST = HARDENED_PROCESS_VERSION_TWO,
 });
 
 /*
