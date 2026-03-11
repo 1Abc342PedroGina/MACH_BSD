@@ -431,6 +431,7 @@ const char *vm_triage_strings[] =
 	[KDBG_TRIAGE_VM_COMPRESSOR_GET_OUT_OF_RANGE] = "Compressor offset requested out of range\n",
 	[KDBG_TRIAGE_VM_COMPRESSOR_GET_NO_PAGE] = "Compressor doesn't have this page\n",
 	[KDBG_TRIAGE_VM_COMPRESSOR_DECOMPRESS_FAILED] = "Decompressor hit a failure\n",
+	[KDBG_TRIAGE_VM_COMPRESSOR_DECOMPRESS_POPCNT_MISMATCH] = "Decompressor popcnt mismatch\n",
 	[KDBG_TRIAGE_VM_SUBMAP_NO_COW_ON_EXECUTABLE] = "Submap disallowed cow on executable range\n",
 	[KDBG_TRIAGE_VM_SUBMAP_COPY_SLOWLY_FAILED] = "Submap object copy_slowly failed\n",
 	[KDBG_TRIAGE_VM_SUBMAP_COPY_STRAT_FAILED] = "Submap object copy_strategically failed\n",
@@ -457,6 +458,8 @@ const char *vm_triage_strings[] =
 	[KDBG_TRIAGE_VM_IOPL_ON_EXEC_PAGE] = "Attempted I/O wiring of page with executable mapping\n",
 	[KDBG_TRIAGE_VM_EXEC_ON_IOPL_PAGE] = "Attempted executable mapping of page already wired for I/O\n",
 	[KDBG_TRIAGE_VM_UPL_WRITE_ON_EXEC_REGION] = "Attempted writable UPL against executable VM region\n",
+	[KDBG_TRIAGE_VM_SOFT_MODE_DISABLE_TRACED] = "Soft mode disabled because process was ptraced\n",
+	[KDBG_TRIAGE_VM_MAP_ENTER_MEM_ENTRY_PARTIAL] = "Partial mapping of a memory entry\n",
 };
 /* VM end */
 
