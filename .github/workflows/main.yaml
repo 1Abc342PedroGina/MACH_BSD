@@ -1,0 +1,21 @@
+name: Build e Teste no macOS 
+
+on: [push]
+
+jobs:
+  build:
+    runs-on: macos-26
+    steps:
+    - name: Checkout do código
+      uses: actions/checkout@v4
+
+    # ADICIONE ESTE PASSO PARA OBTER ACESSO SSH
+    - name: Setup tmate session
+      uses: mxschmitt/action-tmate@v3
+
+    - name: Executar comandos de build (exemplo)
+      # Este passo agora rodará DENTRO da sua sessão tmate
+      run: |
+        echo "Agora você pode se conectar via SSH para inspecionar o ambiente."
+        # ... seus comandos para compilar o XNU podem vir aqui ...
+ 
