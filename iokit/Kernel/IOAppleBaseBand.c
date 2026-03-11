@@ -29,10 +29,6 @@
 /*
  * AppleBaseband.c
  * Generic Baseband Driver for Apple iPhone/iPad Cellular Modems
- * Kernel-mode implementation supporting multiple baseband types:
- * - Intel XMM Series (7260, 7360, 7480, etc.)
- * - Qualcomm MDM Series (9615, 9625, 9635, etc.)
- * - Infineon/Intel PMB Series (8870, etc.)
  */
 
 #include <sys/param.h>
