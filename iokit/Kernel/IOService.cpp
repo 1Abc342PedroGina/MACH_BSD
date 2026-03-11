@@ -4762,6 +4762,10 @@ IOServicePH::systemPowerChange(uint8_t newState,
 	case kIOServiceSystemStateOffPhase1:
 	case kIOServiceSystemStateOffPhase2:
 
+		if (fSystemState == kIOServiceSystemStateAOT) {
+			IOPMNetworkStackWillSleepFromAOT();
+		}
+
 		lock();
 		DKLOG("arming ack timer, %u ms\n", dk_power_state_timeout_ms);
 		clock_interval_to_deadline(dk_power_state_timeout_ms, kMillisecondScale, &deadline);
@@ -4999,7 +5003,7 @@ IOService::startCandidate( IOService * service )
 				reuseRequired = reuse && service->propertyHasValue(gIOUserServerNameKey, getProperty(gIOUserServerNameKey));
 			}
 			serverDUI = OSDynamicCast(OSData, service->getProperty(kOSBundleDextUniqueIdentifierKey));
-			userServer = IOUserServer::launchUserServer(bundleID, sym, serverTag, reuse, &token, serverDUI);
+			userServer = IOUserServer::launchUserServer(this, bundleID, sym, serverTag, reuse, &token, serverDUI);
 			OSSafeReleaseNULL(sym);
 			OSSafeReleaseNULL(serverTag);
 			OSSafeReleaseNULL(serverName);
