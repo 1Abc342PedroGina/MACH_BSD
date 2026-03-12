@@ -1,6 +1,8 @@
 #ifndef IOHFSFMT_H
 #define IOHFSFMT_H
 
+#ifdef HFS_IOKIT_AGAIN
+
 #include <sys/appleapiopts.h>
 #include <sys/types.h>
 
@@ -796,6 +798,9 @@ enum {
 
 #ifdef __cplusplus
 }
+
+#endif
+
 #endif
 
 
