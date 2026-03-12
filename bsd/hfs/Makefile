@@ -6,6 +6,8 @@ export MakeInc_dir=${SRCROOT}/makedefs/MakeInc.dir
 include $(MakeInc_cmd)
 include $(MakeInc_def)
 
+EXPORT_MI_DIR = hfs
+
 DATAFILES = \
 	BTreeScanner.h BTreesInternal.h BTreesPrivate.h \
 	CatalogPrivate.h FileMgrInternal.h HFSUnicodeWrappers.h UCStringCompareData.h \
