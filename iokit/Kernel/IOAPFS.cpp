@@ -11,7 +11,7 @@
 #include <libkern/OSAtomic.h>
 
 #include <sys/param.h>
-#include "IOHFSFmt.h"
+#include <hfs/hfs_format.h>
 #include "IOAPFS.h"
 #include <libkern/crypto/md5.h>
 #include <uuid/uuid.h>
