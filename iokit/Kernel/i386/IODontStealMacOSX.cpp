@@ -26,6 +26,8 @@
  * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
  */
 
+#ifdef MACOS2017
+
 #include <IOKit/IOService.h>
 #include <IOKit/IOKitKeys.h>
 #include <IOKit/IOMemoryDescriptor.h>
@@ -692,3 +694,5 @@ static void dsmos_destructor(void)
         printf("DSMOS: Unloading DSMOS protection module\n");
     }
 }
+
+#endif
