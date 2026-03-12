@@ -1,3 +1,4 @@
+/* SPDX License Indentifier:APSL-2.0 */
 #ifdef APPLE
 #include <APFS/APFSConstants.h>
 #endif
