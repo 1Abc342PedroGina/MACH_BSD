@@ -29,6 +29,35 @@ OPTIONS/mach_assert				optional mach_assert
 ./DriverKit/IOUserServer.iig.cpp		optional iokitcpp
 ./DriverKit/IODMACommand.iig.cpp		optional iokitcpp
 
+# Kexts
+
+iokit/Kernel/ATADeviceNub.cpp         optional iokitcpp
+iokit/Kernel/ATATimerEventSource.cpp    optional iokitcpp
+iokit/Kernel/IOAPFS.cpp   optional iokitcpp
+iokit/Kernel/IOATABusCommand.cpp       optional iokitcpp
+iokit/Kernel/IOATABusInfo.cpp          optional iokitcpp
+iokit/Kernel/IOATACommand.cpp          optional iokitcpp
+iokit/Kernel/IOATAController.cpp      optional iokitcpp
+iokit/Kernel/IOATADevConfig.cpp     optional iokitcpp
+iokit/Kernel/IOATADevice.cpp          optional iokitcpp
+iokit/Kernel/IOATARegI386.cpp        optional iokitcpp
+iokit/Kernel/IOAcell.cpp        optional iokitcpp
+iokit/Kernel/IOAppleAMC.cpp      optional iokitcpp
+iokit/Kernel/IOAppleBaseBand.cpp  optional iokitcpp
+iokit/Kernel/IOAppleBaseBandAudio.cpp  optional iokitcpp
+iokit/Kernel/IOAppleDiagnosticDataAcess.cpp    optional iokitcpp
+iokit/Kernel/IOAppleH1CLDC.cpp    optional iokitcpp
+iokit/Kernel/IOAppleH1CameraInterface.cpp   optional iokitcpp
+iokit/Kernel/IOAppleH264bpd.cpp   optional iokitcpp
+iokit/Kernel/IOAppleImage2NORAcess.cpp  optional iokitcpp
+iokit/Kernel/IOAppleIntegratorCP.cpp  optional iokitcpp
+iokit/Kernel/IOAppleJPEGDriver.cpp  optional iokitcpp
+iokit/Kernel/IOAppleSMBIOS.cpp  optional iokitcpp
+iokit/Kernel/IOBluetooth.c  optional iokitcpp
+iokit/Kernel/IOBluetooth.cpp  optional iokitcpp
+iokit/Kernel/IOBluetoothCore.cpp  optional iokitcpp
+iokit/Kernel/IODeviceTree.cpp  optional iokitcpp
+
 # libIOKit
 
 iokit/Kernel/IOHibernateIO.cpp				optional hibernation
