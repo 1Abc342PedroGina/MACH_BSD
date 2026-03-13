@@ -98,6 +98,834 @@ extern uint32_t vm_compressor_fragmentation_level(void);
 
 int block_corpses = 0; /* counter to block new corpses if jetsam purges them */
 
+#define MEMORYSTATUS_ANALYSIS_DEPTH 10
+#define MEMORYSTATUS_MAX_PROCESSES_TO_ANALYZE 256
+#define MEMORYSTATUS_PRESSURE_HISTORY_SIZE 60 /* 1 minuto a 1 amostra/segundo */
+#define MEMORYSTATUS_COMPRESSOR_SAMPLE_SIZE 20
+
+typedef struct memorystatus_pressure_analysis {
+    /* Análise atual */
+    uint64_t timestamp;
+    uint32_t available_pages;
+    uint32_t free_pages;
+    uint32_t speculative_pages;
+    uint32_t inactive_pages;
+    uint32_t purgeable_pages;
+    uint32_t compressor_pages;
+    uint32_t wired_pages;
+    uint32_t active_pages;
+    
+    /* Tendências */
+    int32_t pressure_trend; /* -100 a +100: negativo = alívio, positivo = agravamento */
+    uint32_t pressure_acceleration; /* Quão rápido a pressão está aumentando */
+    
+    /* Estatísticas do compressor */
+    uint32_t compressor_ratio; /* 0-100% */
+    uint32_t compressor_fragmentation;
+    uint32_t compressor_segments_count;
+    uint64_t compressor_total_uncompressed;
+    uint32_t compressor_swapout_queue_length;
+    uint32_t compressor_swapin_queue_length;
+    
+    /* Análise de processos */
+    uint32_t total_processes_analyzed;
+    uint32_t processes_over_limit;
+    uint32_t processes_near_limit; /* >80% do limite */
+    uint32_t processes_with_large_purgeable;
+    uint64_t total_purgeable_pages_all_processes;
+    
+    /* Top offenders */
+    struct {
+        pid_t pid;
+        char name[MAXCOMLEN+1];
+        uint64_t footprint;
+        uint64_t purgeable;
+        uint64_t compressed;
+        uint32_t priority;
+        uint32_t days_since_last_use;
+        boolean_t is_essential;
+        float score; /* 0-100, quão bom candidato é para kill */
+    } top_candidates[MEMORYSTATUS_MAX_PROCESSES_TO_ANALYZE];
+    uint32_t candidate_count;
+    
+    /* Diagnóstico */
+    char primary_issue[256];
+    char recommended_action[256];
+    uint32_t severity_score; /* 0-1000 */
+    boolean_t critical_system_health;
+    
+    /* Histórico (para análise de tendências) */
+    uint32_t pressure_history[MEMORYSTATUS_PRESSURE_HISTORY_SIZE];
+    uint32_t history_index;
+    uint32_t history_count;
+    
+    /* Recomendações específicas */
+    uint32_t recommended_pages_to_free;
+    uint32_t recommended_kill_count;
+    uint32_t recommended_freeze_count;
+    uint32_t recommended_compressor_actions;
+    
+} memorystatus_pressure_analysis_t;
+
+static memorystatus_pressure_analysis_t g_pressure_analysis;
+static lck_mtx_t *g_analysis_lock;
+
+static void
+memorystatus_init_analysis(void)
+{
+    static boolean_t initialized = FALSE;
+    
+    if (!initialized) {
+        lck_mtx_init(&g_analysis_lock, &memorystatus_lock_group, LCK_ATTR_NULL);
+        memset(&g_pressure_analysis, 0, sizeof(g_pressure_analysis_t));
+        g_pressure_analysis.history_index = 0;
+        g_pressure_analysis.history_count = 0;
+        initialized = TRUE;
+        
+        memorystatus_log("memorystatus: pressure analysis system initialized\n");
+    }
+}
+
+/*
+ * Coleta estatísticas detalhadas do compressor
+ */
+static void
+memorystatus_sample_compressor_stats(memorystatus_pressure_analysis_t *analysis)
+{
+    kern_return_t kr;
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    vm_statistics64_data_t vm_stat;
+    
+    kr = host_statistics64(host_self(), HOST_VM_INFO64, (host_info64_t)&vm_stat, &count);
+    if (kr != KERN_SUCCESS) {
+        memorystatus_log_error("memorystatus_sample_compressor_stats: host_statistics64 failed\n");
+        return;
+    }
+    
+    analysis->compressor_pages = vm_stat.compressor_page_count;
+    analysis->compressor_total_uncompressed = vm_stat.total_uncompressed_pages_in_compressor;
+    
+    if (analysis->compressor_pages > 0) {
+        analysis->compressor_ratio = (uint32_t)((analysis->compressor_total_uncompressed * 100) / 
+                                                 analysis->compressor_pages);
+    } else {
+        analysis->compressor_ratio = 0;
+    }
+    
+    analysis->compressor_fragmentation = vm_compressor_fragmentation_level();
+    
+    /* Estatísticas adicionais do compressor (assumindo que existem variáveis globais para isso) */
+    extern uint32_t c_segment_count;
+    extern uint32_t c_late_swapout_count;
+    extern uint32_t c_late_swappedin_count;
+    
+    analysis->compressor_segments_count = c_segment_count;
+    analysis->compressor_swapout_queue_length = c_late_swapout_count;
+    analysis->compressor_swapin_queue_length = c_late_swappedin_count;
+}
+
+/*
+ * Calcula a tendência de pressão baseada no histórico
+ */
+static void
+memorystatus_calculate_pressure_trend(memorystatus_pressure_analysis_t *analysis)
+{
+    uint32_t i;
+    int64_t sum_differences = 0;
+    int64_t sum_weights = 0;
+    uint32_t oldest_valid_index;
+    
+    if (analysis->history_count < 3) {
+        analysis->pressure_trend = 0;
+        analysis->pressure_acceleration = 0;
+        return;
+    }
+    
+    /* Usa uma média ponderada temporal para calcular a tendência */
+    oldest_valid_index = (analysis->history_index - analysis->history_count + 
+                         MEMORYSTATUS_PRESSURE_HISTORY_SIZE) % MEMORYSTATUS_PRESSURE_HISTORY_SIZE;
+    
+    for (i = 0; i < analysis->history_count - 1; i++) {
+        uint32_t idx1 = (oldest_valid_index + i) % MEMORYSTATUS_PRESSURE_HISTORY_SIZE;
+        uint32_t idx2 = (oldest_valid_index + i + 1) % MEMORYSTATUS_PRESSURE_HISTORY_SIZE;
+        int32_t difference = (int32_t)analysis->pressure_history[idx2] - 
+                             (int32_t)analysis->pressure_history[idx1];
+        uint32_t weight = i + 1; /* Dá mais peso às mudanças recentes */
+        
+        sum_differences += (int64_t)difference * (int64_t)weight;
+        sum_weights += weight;
+    }
+    
+    if (sum_weights > 0) {
+        analysis->pressure_trend = (int32_t)((sum_differences * 100) / sum_weights);
+    } else {
+        analysis->pressure_trend = 0;
+    }
+    
+    /* Calcula aceleração (segunda derivada) */
+    if (analysis->history_count >= 5) {
+        int32_t first_half_trend = 0;
+        int32_t second_half_trend = 0;
+        uint32_t half = analysis->history_count / 2;
+        
+        for (i = 0; i < half; i++) {
+            uint32_t idx1 = (oldest_valid_index + i) % MEMORYSTATUS_PRESSURE_HISTORY_SIZE;
+            uint32_t idx2 = (oldest_valid_index + i + 1) % MEMORYSTATUS_PRESSURE_HISTORY_SIZE;
+            first_half_trend += (int32_t)analysis->pressure_history[idx2] - 
+                                (int32_t)analysis->pressure_history[idx1];
+        }
+        
+        for (i = half; i < analysis->history_count - 1; i++) {
+            uint32_t idx1 = (oldest_valid_index + i) % MEMORYSTATUS_PRESSURE_HISTORY_SIZE;
+            uint32_t idx2 = (oldest_valid_index + i + 1) % MEMORYSTATUS_PRESSURE_HISTORY_SIZE;
+            second_half_trend += (int32_t)analysis->pressure_history[idx2] - 
+                                  (int32_t)analysis->pressure_history[idx1];
+        }
+        
+        analysis->pressure_acceleration = (uint32_t)MAX(0, second_half_trend - first_half_trend);
+    } else {
+        analysis->pressure_acceleration = 0;
+    }
+}
+
+/*
+ * Atualiza o histórico de pressão
+ */
+static void
+memorystatus_update_pressure_history(memorystatus_pressure_analysis_t *analysis, 
+                                      uint32_t current_pressure)
+{
+    analysis->pressure_history[analysis->history_index] = current_pressure;
+    analysis->history_index = (analysis->history_index + 1) % MEMORYSTATUS_PRESSURE_HISTORY_SIZE;
+    
+    if (analysis->history_count < MEMORYSTATUS_PRESSURE_HISTORY_SIZE) {
+        analysis->history_count++;
+    }
+    
+    memorystatus_calculate_pressure_trend(analysis);
+}
+
+/*
+ * Analisa um processo individual e coleta métricas detalhadas
+ */
+static boolean_t
+memorystatus_analyze_process(proc_t p, 
+                             memorystatus_pressure_analysis_t *analysis,
+                             uint32_t current_time_seconds)
+{
+    task_t task = proc_task(p);
+    uint64_t footprint = get_task_phys_footprint(task);
+    uint64_t footprint_pages = footprint / PAGE_SIZE_64;
+    uint64_t purgeable = get_task_purgeable_size(task) / PAGE_SIZE_64;
+    uint64_t compressed = get_task_compressed(task) / PAGE_SIZE_64;
+    uint64_t internal = get_task_internal(task) / PAGE_SIZE_64;
+    uint64_t iokit = get_task_iokit_mapped(task) / PAGE_SIZE_64;
+    
+    int32_t memlimit;
+    task_get_phys_footprint_limit(task, &memlimit);
+    uint64_t memlimit_pages = (memlimit > 0) ? (memlimit * (1024*1024) / PAGE_SIZE_64) : 0;
+    
+    uint32_t days_since_last_use = 0;
+    uint64_t last_used_time = task_get_last_used_time(task);
+    if (last_used_time > 0 && last_used_time < current_time_seconds) {
+        days_since_last_use = (current_time_seconds - last_used_time) / (24 * 3600);
+    }
+    
+    boolean_t is_essential = (p->p_memstat_effectivepriority >= JETSAM_PRIORITY_FOREGROUND) ||
+                              (p == initproc) || (p == kernproc) ||
+                              (p->p_memstat_state & P_MEMSTAT_CRITICAL);
+    
+    analysis->total_processes_analyzed++;
+    
+    /* Contabiliza processos com problemas */
+    if (memlimit_pages > 0 && footprint_pages > memlimit_pages) {
+        analysis->processes_over_limit++;
+    } else if (memlimit_pages > 0 && footprint_pages > (memlimit_pages * 80 / 100)) {
+        analysis->processes_near_limit++;
+    }
+    
+    if (purgeable > 100) { /* Mais de 100 páginas purgeable */
+        analysis->processes_with_large_purgeable++;
+        analysis->total_purgeable_pages_all_processes += purgeable;
+    }
+    
+    /* Calcula score de candidatura para kill (0-100, maior = melhor candidato) */
+    if (!is_essential && !(p->p_memstat_state & P_MEMSTAT_INTERNAL)) {
+        float score = 0;
+        
+        /* Tamanho do footprint (0-40 pontos) */
+        if (footprint_pages > 0) {
+            uint64_t max_footprint = max_mem / PAGE_SIZE_64;
+            score += 40.0f * ((float)footprint_pages / (float)max_footprint);
+        }
+        
+        /* Tempo sem uso (0-30 pontos) */
+        score += MIN(30, days_since_last_use * 5);
+        
+        /* Prioridade Jetsam (0-20 pontos, menor prioridade = maior score) */
+        int priority_score = 20 - MIN(20, p->p_memstat_effectivepriority);
+        score += MAX(0, priority_score);
+        
+        /* Purgeable memory (0-10 pontos) */
+        if (purgeable > 0 && footprint_pages > 0) {
+            float purgeable_ratio = (float)purgeable / (float)footprint_pages;
+            score += 10.0f * purgeable_ratio;
+        }
+        
+        /* Adiciona aos candidatos se score for significativo */
+        if (score > 10 && analysis->candidate_count < MEMORYSTATUS_MAX_PROCESSES_TO_ANALYZE) {
+            memorystatus_jetsam_snapshot_entry_t *candidate = 
+                &analysis->top_candidates[analysis->candidate_count];
+            
+            candidate->pid = proc_getpid(p);
+            strlcpy(candidate->name, p->p_name, sizeof(candidate->name));
+            candidate->pages = footprint_pages;
+            candidate->purgeable_pages = purgeable;
+            candidate->jse_internal_compressed_pages = compressed;
+            candidate->priority = p->p_memstat_effectivepriority;
+            candidate->score = score;
+            candidate->days_since_last_use = days_since_last_use;
+            candidate->is_essential = is_essential;
+            
+            analysis->candidate_count++;
+        }
+        
+        return TRUE;
+    }
+    
+    return FALSE;
+}
+
+/*
+ * Ordena candidatos por score (melhor candidato primeiro)
+ */
+static int
+memorystatus_compare_candidates(const void *a, const void *b)
+{
+    const memorystatus_jetsam_snapshot_entry_t *ca = a;
+    const memorystatus_jetsam_snapshot_entry_t *cb = b;
+    
+    if (cb->score > ca->score) return 1;
+    if (cb->score < ca->score) return -1;
+    return 0;
+}
+
+/*
+ * Analisa todos os processos do sistema
+ */
+static void
+memorystatus_analyze_all_processes(memorystatus_pressure_analysis_t *analysis)
+{
+    proc_t p;
+    unsigned int bucket = 0;
+    uint64_t current_time_seconds;
+    
+    clock_sec_t tv_sec;
+    clock_usec_t tv_usec;
+    absolutetime_to_microtime(mach_absolute_time(), &tv_sec, &tv_usec);
+    current_time_seconds = tv_sec;
+    
+    analysis->total_processes_analyzed = 0;
+    analysis->processes_over_limit = 0;
+    analysis->processes_near_limit = 0;
+    analysis->processes_with_large_purgeable = 0;
+    analysis->total_purgeable_pages_all_processes = 0;
+    analysis->candidate_count = 0;
+    
+    proc_list_lock();
+    
+    p = memorystatus_get_first_proc_locked(&bucket, TRUE);
+    while (p && analysis->total_processes_analyzed < 1000) {
+        (void)memorystatus_analyze_process(p, analysis, current_time_seconds);
+        p = memorystatus_get_next_proc_locked(&bucket, p, TRUE);
+    }
+    
+    proc_list_unlock();
+    
+    /* Ordena candidatos por score */
+    if (analysis->candidate_count > 0) {
+        qsort(analysis->top_candidates, analysis->candidate_count, 
+              sizeof(memorystatus_jetsam_snapshot_entry_t), 
+              memorystatus_compare_candidates);
+    }
+}
+
+/*
+ * Diagnostica a causa primária da pressão de memória
+ */
+static void
+memorystatus_diagnose_primary_issue(memorystatus_pressure_analysis_t *analysis)
+{
+    /* Diagnóstico baseado nas métricas coletadas */
+    
+    if (analysis->compressor_ratio > 300) {
+        /* Compressor muito eficiente, mas sobrecarregado */
+        snprintf(analysis->primary_issue, sizeof(analysis->primary_issue),
+                 "Compressor severely overloaded with %u%% efficiency ratio. "
+                 "%u segments in swapout queue.",
+                 analysis->compressor_ratio, analysis->compressor_swapout_queue_length);
+        
+        snprintf(analysis->recommended_action, sizeof(analysis->recommended_action),
+                 "Force swapout of waiting segments and consider killing %d "
+                 "compressor-heavy processes",
+                 MIN(3, analysis->candidate_count));
+        
+        analysis->severity_score += 300;
+        analysis->recommended_compressor_actions = 2;
+        
+    } else if (analysis->purgeable_pages > analysis->available_pages * 2) {
+        /* Muita memória purgeable */
+        snprintf(analysis->primary_issue, sizeof(analysis->primary_issue),
+                 "Excessive purgeable memory: %u pages across %u processes",
+                 analysis->purgeable_pages, analysis->processes_with_large_purgeable);
+        
+        snprintf(analysis->recommended_action, sizeof(analysis->recommended_action),
+                 "Force purge of all purgeable memory");
+        
+        analysis->severity_score += 200;
+        analysis->recommended_pages_to_free = analysis->purgeable_pages;
+        
+    } else if (analysis->processes_over_limit > 0) {
+        /* Processos acima do limite */
+        snprintf(analysis->primary_issue, sizeof(analysis->primary_issue),
+                 "%u processes exceed their memory limits", 
+                 analysis->processes_over_limit);
+        
+        snprintf(analysis->recommended_action, sizeof(analysis->recommended_action),
+                 "Kill %d top memory limit offenders", 
+                 MIN(analysis->processes_over_limit, 3));
+        
+        analysis->severity_score += 150 * analysis->processes_over_limit;
+        analysis->recommended_kill_count = analysis->processes_over_limit;
+        
+    } else if (analysis->pressure_trend > 20 && analysis->pressure_acceleration > 10) {
+        /* Pressão crescendo rapidamente */
+        snprintf(analysis->primary_issue, sizeof(analysis->primary_issue),
+                 "Rapid memory pressure increase: trend %d, acceleration %u",
+                 analysis->pressure_trend, analysis->pressure_acceleration);
+        
+        snprintf(analysis->recommended_action, sizeof(analysis->recommended_action),
+                 "Proactive freezing of background processes");
+        
+        analysis->severity_score += 250;
+        analysis->recommended_freeze_count = 5;
+        
+    } else if (analysis->compressor_swapin_queue_length > 100) {
+        /* Muitos segmentos esperando para serem swap-in */
+        snprintf(analysis->primary_issue, sizeof(analysis->primary_issue),
+                 "Swap-in queue congestion: %u segments waiting",
+                 analysis->compressor_swapin_queue_length);
+        
+        snprintf(analysis->recommended_action, sizeof(analysis->recommended_action),
+                 "Process swap-in queue and adjust swap thresholds");
+        
+        analysis->severity_score += 180;
+        analysis->recommended_compressor_actions = 1;
+        
+    } else {
+        snprintf(analysis->primary_issue, sizeof(analysis->primary_issue),
+                 "General memory pressure: available pages %u (%.1fMB)",
+                 analysis->available_pages, 
+                 (float)ptoa_32(analysis->available_pages) / (1024*1024));
+        
+        snprintf(analysis->recommended_action, sizeof(analysis->recommended_action),
+                 "Standard Jetsam protocol - kill top candidates");
+        
+        analysis->severity_score += 100;
+        analysis->recommended_kill_count = MAX(1, analysis->candidate_count / 10);
+    }
+    
+    /* Ajusta severity baseado em outras métricas */
+    if (analysis->available_pages < memstat_critical_threshold) {
+        analysis->severity_score += 500;
+        analysis->critical_system_health = FALSE;
+    } else if (analysis->available_pages < memstat_soft_threshold) {
+        analysis->severity_score += 300;
+    } else if (analysis->available_pages < memstat_idle_threshold) {
+        analysis->severity_score += 100;
+    }
+    
+    if (analysis->compressor_fragmentation > 50) {
+        analysis->severity_score += 100;
+    }
+    
+    analysis->severity_score = MIN(1000, analysis->severity_score);
+}
+
+/*
+ * Executa ações baseadas na análise
+ */
+static boolean_t
+memorystatus_execute_mitigation_plan(memorystatus_pressure_analysis_t *analysis)
+{
+    boolean_t action_taken = FALSE;
+    uint64_t total_pages_freed = 0;
+    uint32_t kills_performed = 0;
+    uint32_t freezes_performed = 0;
+    
+    memorystatus_log("memorystatus: EXECUTING MITIGATION PLAN - Severity %u/1000\n", 
+                     analysis->severity_score);
+    memorystatus_log("  Primary issue: %s\n", analysis->primary_issue);
+    memorystatus_log("  Recommended: %s\n", analysis->recommended_action);
+    
+    /* Nível 1: Purgar memória purgeable */
+    if (analysis->recommended_pages_to_free > 0) {
+        memorystatus_log("memorystatus: Level 1 - Purging memory\n");
+        
+        /* Purge de todos os processos com purgeable */
+        proc_t p;
+        unsigned int bucket = 0;
+        uint64_t purged = 0;
+        
+        proc_list_lock();
+        p = memorystatus_get_first_proc_locked(&bucket, TRUE);
+        while (p) {
+            purged += vm_purgeable_purge_task_owned(proc_task(p));
+            p = memorystatus_get_next_proc_locked(&bucket, p, TRUE);
+        }
+        proc_list_unlock();
+        
+        total_pages_freed += purged;
+        memorystatus_log("memorystatus: Purged %llu pages\n", purged);
+        action_taken = TRUE;
+    }
+    
+    /* Nível 2: Ações do compressor */
+    if (analysis->recommended_compressor_actions > 0) {
+        memorystatus_log("memorystatus: Level 2 - Compressor actions\n");
+        
+        if (analysis->compressor_swapout_queue_length > 0) {
+            /* Força swapout dos segmentos na fila */
+            extern void vm_compressor_force_swapout(uint32_t count);
+            vm_compressor_force_swapout(analysis->compressor_swapout_queue_length);
+            memorystatus_log("memorystatus: Forced swapout of %u segments\n",
+                             analysis->compressor_swapout_queue_length);
+            action_taken = TRUE;
+        }
+        
+        if (analysis->compressor_swapin_queue_length > 100) {
+            /* Processa fila de swapin */
+            vm_compressor_process_special_swapped_in_segments();
+            memorystatus_log("memorystatus: Processed swapin queue\n");
+            action_taken = TRUE;
+        }
+        
+        if (analysis->compressor_fragmentation > 50) {
+            /* Força compactação do compressor */
+            extern void vm_compressor_compact(void);
+            vm_compressor_compact();
+            memorystatus_log("memorystatus: Forced compressor compaction\n");
+            action_taken = TRUE;
+        }
+    }
+    
+    /* Nível 3: Freezing de processos (se disponível) */
+#if CONFIG_FREEZE
+    if (analysis->recommended_freeze_count > 0) {
+        memorystatus_log("memorystatus: Level 3 - Freezing processes\n");
+        
+        /* Tenta congelar os melhores candidatos que não são essenciais */
+        for (uint32_t i = 0; i < analysis->candidate_count && 
+                            freezes_performed < analysis->recommended_freeze_count; i++) {
+            if (!analysis->top_candidates[i].is_essential &&
+                analysis->top_candidates[i].days_since_last_use > 0) {
+                
+                pid_t pid = analysis->top_candidates[i].pid;
+                proc_t p = proc_find(pid);
+                
+                if (p) {
+                    if (memorystatus_freeze_process(p, kMemorystatusFreezeSkipReasonNone)) {
+                        freezes_performed++;
+                        total_pages_freed += analysis->top_candidates[i].pages;
+                        memorystatus_log("memorystatus: Frozen process %d [%s]\n", 
+                                         pid, analysis->top_candidates[i].name);
+                    }
+                    proc_rele(p);
+                }
+            }
+        }
+        
+        if (freezes_performed > 0) {
+            action_taken = TRUE;
+            memorystatus_log("memorystatus: Froze %u processes\n", freezes_performed);
+        }
+    }
+#endif /* CONFIG_FREEZE */
+    
+    /* Nível 4: Killing seletivo */
+    if (analysis->recommended_kill_count > 0) {
+        memorystatus_log("memorystatus: Level 4 - Selective killing\n");
+        
+        for (uint32_t i = 0; i < analysis->candidate_count && 
+                            kills_performed < analysis->recommended_kill_count; i++) {
+            if (!analysis->top_candidates[i].is_essential) {
+                pid_t pid = analysis->top_candidates[i].pid;
+                os_reason_t reason = os_reason_create(OS_REASON_JETSAM, 
+                                                       JETSAM_REASON_MEMORY_PRESSURE);
+                
+                if (reason) {
+                    if (memstat_kill_process_sync(pid, 
+                                                   kMemorystatusKilledSustainedPressure, 
+                                                   reason)) {
+                        kills_performed++;
+                        total_pages_freed += analysis->top_candidates[i].pages;
+                        memorystatus_log("memorystatus: Killed process %d [%s]\n", 
+                                         pid, analysis->top_candidates[i].name);
+                    } else {
+                        os_reason_free(reason);
+                    }
+                }
+            }
+        }
+        
+        if (kills_performed > 0) {
+            action_taken = TRUE;
+            memorystatus_log("memorystatus: Killed %u processes, freed %llu pages\n", 
+                             kills_performed, total_pages_freed);
+        }
+    }
+    
+    /* Nível 5: Jetsam completo (último recurso) */
+    if (!action_taken || analysis->severity_score > 800) {
+        memorystatus_log("memorystatus: Level 5 - Full Jetsam protocol\n");
+        
+        /* Ordena o bucket foreground antes do Jetsam agressivo */
+        memstat_sort_bucket(JETSAM_PRIORITY_FOREGROUND, memstat_jetsam_fg_sort_order);
+        
+        /* Executa Jetsam agressivo */
+        uint32_t errors = 0;
+        uint64_t reclaimed = 0;
+        boolean_t killed = memorystatus_kill_processes_aggressive(
+            kMemorystatusKilledSustainedPressure,
+            1, /* aggr_count */
+            JETSAM_PRIORITY_MAX,
+            10, /* max_kills */
+            &errors, &reclaimed);
+        
+        if (killed) {
+            action_taken = TRUE;
+            total_pages_freed += reclaimed;
+            memorystatus_log("memorystatus: Aggressive Jetsam freed %llu pages\n", reclaimed);
+        }
+    }
+    
+    /* Se ainda não resolveu, panic? */
+    if (!action_taken && analysis->severity_score > 900) {
+        memorystatus_log("memorystatus: CRITICAL - No mitigation possible, system unstable\n");
+        panic("memorystatus: Unable to mitigate critical memory pressure");
+    }
+    
+    return action_taken;
+}
+
+/*
+ * FUNÇÃO PRINCIPAL: Análise completa e mitigação da pressão de memória
+ *
+ * Esta função realiza uma análise profunda do estado da memória do sistema,
+ * diagnostica a causa raiz da pressão e executa um plano de mitigação em
+ * múltiplos níveis, desde purging de cache até Jetsam completo.
+ *
+ * Parâmetros:
+ *   force_analysis - Se TRUE, força uma análise completa mesmo sem pressão
+ *   detailed_report - Se TRUE, gera um relatório detalhado no log
+ *
+ * Retorno:
+ *   TRUE se alguma ação foi tomada, FALSE caso contrário
+ */
+boolean_t
+memorystatus_analyze_and_mitigate_pressure(boolean_t force_analysis, 
+                                            boolean_t detailed_report)
+{
+    kern_return_t kr;
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    vm_statistics64_data_t vm_stat;
+    memorystatus_pressure_analysis_t analysis;
+    boolean_t action_taken = FALSE;
+    uint64_t start_time, end_time, elapsed_ns;
+    uint32_t elapsed_ms;
+    
+    start_time = mach_absolute_time();
+    
+    /* Inicializa sistema de análise se necessário */
+    memorystatus_init_analysis();
+    
+    /* Obtém lock para análise exclusiva */
+    lck_mtx_lock(&g_analysis_lock);
+    
+    /* Limpa a estrutura de análise */
+    memset(&analysis, 0, sizeof(analysis));
+    analysis.timestamp = mach_absolute_time();
+    
+    memorystatus_log("==================================================\n");
+    memorystatus_log("memorystatus: BEGINNING PRESSURE ANALYSIS\n");
+    memorystatus_log("==================================================\n");
+    
+    /* Passo 1: Coleta estatísticas básicas de VM */
+    kr = host_statistics64(host_self(), HOST_VM_INFO64, (host_info64_t)&vm_stat, &count);
+    if (kr != KERN_SUCCESS) {
+        memorystatus_log_error("memorystatus_analyze_pressure: host_statistics64 failed\n");
+        lck_mtx_unlock(&g_analysis_lock);
+        return FALSE;
+    }
+    
+    analysis.available_pages = vm_stat.free_count + vm_stat.speculative_count;
+    analysis.free_pages = vm_stat.free_count;
+    analysis.speculative_pages = vm_stat.speculative_count;
+    analysis.inactive_pages = vm_stat.inactive_count;
+    analysis.purgeable_pages = vm_stat.purgeable_count;
+    analysis.wired_pages = vm_stat.wire_count;
+    analysis.active_pages = vm_stat.active_count;
+    
+    memorystatus_log("Step 1: VM Statistics Collected\n");
+    memorystatus_log("  Available: %u pages (%.1f MB)\n", 
+                     analysis.available_pages, 
+                     (float)ptoa_32(analysis.available_pages) / (1024*1024));
+    memorystatus_log("  Free: %u, Speculative: %u, Inactive: %u\n",
+                     analysis.free_pages, analysis.speculative_pages, 
+                     analysis.inactive_pages);
+    memorystatus_log("  Purgeable: %u, Wired: %u, Active: %u\n",
+                     analysis.purgeable_pages, analysis.wired_pages, 
+                     analysis.active_pages);
+    
+    /* Passo 2: Atualiza histórico e calcula tendências */
+    memorystatus_update_pressure_history(&analysis, analysis.available_pages);
+    
+    memorystatus_log("Step 2: Pressure Trends\n");
+    memorystatus_log("  Trend: %d, Acceleration: %u\n",
+                     analysis.pressure_trend, analysis.pressure_acceleration);
+    
+    /* Passo 3: Amostra estatísticas do compressor */
+    memorystatus_sample_compressor_stats(&analysis);
+    
+    memorystatus_log("Step 3: Compressor Analysis\n");
+    memorystatus_log("  Pages: %u, Ratio: %u%%, Fragmentation: %u%%\n",
+                     analysis.compressor_pages, analysis.compressor_ratio,
+                     analysis.compressor_fragmentation);
+    memorystatus_log("  SwapOut Queue: %u, SwapIn Queue: %u\n",
+                     analysis.compressor_swapout_queue_length,
+                     analysis.compressor_swapin_queue_length);
+    
+    /* Passo 4: Analisa todos os processos */
+    memorystatus_analyze_all_processes(&analysis);
+    
+    memorystatus_log("Step 4: Process Analysis\n");
+    memorystatus_log("  Processes analyzed: %u\n", analysis.total_processes_analyzed);
+    memorystatus_log("  Over limit: %u, Near limit: %u\n",
+                     analysis.processes_over_limit, analysis.processes_near_limit);
+    memorystatus_log("  With large purgeable: %u (total %llu pages)\n",
+                     analysis.processes_with_large_purgeable,
+                     analysis.total_purgeable_pages_all_processes);
+    
+    /* Passo 5: Diagnostica causa primária */
+    memorystatus_diagnose_primary_issue(&analysis);
+    
+    memorystatus_log("Step 5: Diagnosis\n");
+    memorystatus_log("  Primary Issue: %s\n", analysis.primary_issue);
+    memorystatus_log("  Severity Score: %u/1000\n", analysis.severity_score);
+    memorystatus_log("  Recommended: %s\n", analysis.recommended_action);
+    
+    /* Passo 6: Se solicitado, gera relatório detalhado */
+    if (detailed_report || analysis.severity_score > 500) {
+        memorystatus_log("\n--- DETAILED PROCESS REPORT ---\n");
+        memorystatus_log("Top %u memory candidates (score/pid/name/pages/days):\n",
+                         MIN(10, analysis.candidate_count));
+        
+        for (uint32_t i = 0; i < MIN(10, analysis.candidate_count); i++) {
+            memorystatus_log("  %2u: Score %3.1f | PID %5d | %-16s | %6llu pages | %u days\n",
+                             i+1, 
+                             analysis.top_candidates[i].score,
+                             analysis.top_candidates[i].pid,
+                             analysis.top_candidates[i].name,
+                             analysis.top_candidates[i].pages,
+                             analysis.top_candidates[i].days_since_last_use);
+        }
+        memorystatus_log("--- END DETAILED REPORT ---\n");
+    }
+    
+    /* Passo 7: Executa plano de mitigação se necessário */
+    if (force_analysis || 
+        analysis.available_pages < memstat_idle_threshold || 
+        analysis.severity_score > 300) {
+        
+        memorystatus_log("Step 7: Executing Mitigation Plan\n");
+        action_taken = memorystatus_execute_mitigation_plan(&analysis);
+    } else {
+        memorystatus_log("Step 7: No mitigation needed (pressure normal)\n");
+    }
+    
+    /* Atualiza estrutura global com resultados */
+    memcpy(&g_pressure_analysis, &analysis, sizeof(analysis));
+    
+    /* Métricas de performance */
+    end_time = mach_absolute_time();
+    absolutetime_to_nanoseconds(end_time - start_time, &elapsed_ns);
+    elapsed_ms = (uint32_t)(elapsed_ns / NSEC_PER_MSEC);
+    
+    memorystatus_log("==================================================\n");
+    memorystatus_log("memorystatus: ANALYSIS COMPLETE - %u ms elapsed\n", elapsed_ms);
+    memorystatus_log("  Action taken: %s\n", action_taken ? "YES" : "NO");
+    memorystatus_log("==================================================\n");
+    
+    lck_mtx_unlock(&g_analysis_lock);
+    
+    return action_taken;
+}
+
+/*
+ * Versão simplificada para uso em sysctl ou chamadas de emergência
+ */
+int
+memorystatus_emergency_pressure_response(void)
+{
+    memorystatus_log("memorystatus: EMERGENCY PRESSURE RESPONSE INITIATED\n");
+    
+    /* Força análise completa com relatório detalhado */
+    boolean_t action_taken = memorystatus_analyze_and_mitigate_pressure(TRUE, TRUE);
+    
+    if (!action_taken) {
+        /* Último recurso - mata o maior processo disponível */
+        os_reason_t reason = os_reason_create(OS_REASON_JETSAM, 
+                                               JETSAM_REASON_MEMORY_EMERGENCY);
+        if (reason) {
+            memstat_kill_process_sync(-1, kMemorystatusKilledSustainedPressure, reason);
+        }
+    }
+    
+    return 0;
+}
+
+/*
+ * Sysctl handler para acionar a análise manualmente
+ */
+static int
+sysctl_memorystatus_analyze_pressure SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+    int error = 0;
+    int force = 0;
+    
+    error = sysctl_handle_int(oidp, &force, 0, req);
+    if (error || !req->newptr) {
+        return error;
+    }
+    
+    if (force != 0 && force != 1) {
+        return EINVAL;
+    }
+    
+    boolean_t result = memorystatus_analyze_and_mitigate_pressure(force == 1, TRUE);
+    
+    memorystatus_log("memorystatus: Manual analysis %s\n", 
+                     result ? "took action" : "no action needed");
+    
+    return 0;
+}
+
+SYSCTL_PROC(_kern_memorystatus, OID_AUTO, analyze_pressure,
+            CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+            0, 0, sysctl_memorystatus_analyze_pressure, "I",
+            "Trigger memory pressure analysis (1=force)");
+
 /* For logging clarity */
 static const char *memstat_kill_cause_name[] = {
 	"",                                             /* kMemorystatusInvalid							*/
@@ -1617,6 +2445,33 @@ SYSCTL_PROC(_kern_memorystatus, OID_AUTO, ballast_drained,
  * TODO: If adopted on production systems, this mechanism should use a
  * dedicated system-call / memorystatus-command
  */
+
+int
+memorystatus_kill_pid(pid_t victim_pid, uint32_t cause)
+{
+    os_reason_t jetsam_reason;
+    bool killed;
+    
+    if (victim_pid <= 0) {
+        return EINVAL;
+    }
+    
+    jetsam_reason = os_reason_create(OS_REASON_JETSAM, (jetsam_reason_t)cause);
+    if (jetsam_reason == OS_REASON_NULL) {
+        memorystatus_log_error("memorystatus_kill_pid: failed to allocate jetsam reason\n");
+        return ENOMEM;
+    }
+    
+    killed = memstat_kill_process_sync(victim_pid, cause, jetsam_reason);
+    
+    if (!killed) {
+        os_reason_free(jetsam_reason);
+        return ESRCH;
+    }
+    
+    return 0;
+}
+
 static int
 memstat_clear_the_decks(bool clear)
 {
@@ -3591,6 +4446,61 @@ exit:
 }
 
 int
+memorystatus_get_process_memory_info(pid_t pid, 
+    uint64_t *footprint,
+    uint64_t *max_footprint,
+    uint64_t *purgeable,
+    int32_t *memlimit)
+{
+    proc_t p;
+    kern_return_t kr;
+    
+    p = proc_find(pid);
+    if (!p) {
+        return ESRCH;
+    }
+    
+    if (footprint) {
+        *footprint = get_task_phys_footprint(proc_task(p));
+    }
+    
+    if (max_footprint) {
+        *max_footprint = get_task_phys_footprint_lifetime_max(proc_task(p));
+    }
+    
+    if (purgeable) {
+        *purgeable = get_task_purgeable_size(proc_task(p));
+    }
+    
+    if (memlimit) {
+        kr = task_get_phys_footprint_limit(proc_task(p), memlimit);
+        if (kr != KERN_SUCCESS) {
+            *memlimit = -1;
+        }
+    }
+    
+    proc_rele(p);
+    return 0;
+}
+
+memorystatus_pressure_level_t
+memorystatus_get_current_pressure_level(void)
+{
+    uint32_t available_pages = os_atomic_load(&memorystatus_available_pages, relaxed);
+    
+    if (available_pages < memstat_critical_threshold) {
+        return kMemorystatusPressureCritical;
+    } else if (available_pages < memstat_soft_threshold) {
+        return kMemorystatusPressureWarning;
+    } else if (available_pages < memstat_idle_threshold) {
+        return kMemorystatusPressureLow;
+    }
+    
+    return kMemorystatusPressureNormal;
+}
+
+
+int
 memorystatus_dirty_set(proc_t p, boolean_t self, uint32_t pcontrol)
 {
 	int ret = 0;
@@ -5085,6 +5995,80 @@ memorystatus_thread(void *param __unused, wait_result_t wr __unused)
 	}
 }
 
+
+#if DEVELOPMENT || DEBUG
+/*
+ * Marca um processo para debug extendido do Jetsam
+ */
+int
+memorystatus_debug_process(pid_t pid)
+{
+    proc_t p;
+    
+    p = proc_find(pid);
+    if (!p) {
+        return ESRCH;
+    }
+    
+    proc_list_lock();
+    p->p_memstat_state |= P_MEMSTAT_DEBUG;
+    proc_list_unlock();
+    
+    memorystatus_log("memorystatus: debug enabled for pid %d [%s]\n", 
+        pid, proc_best_name(p));
+    
+    proc_rele(p);
+    return 0;
+}
+#endif
+
+/*
+ * Força uma verificação imediata do Jetsam
+ */
+void
+memorystatus_force_check(void)
+{
+    memorystatus_log("memorystatus: forcing Jetsam check\n");
+    
+    /* Atualiza a contagem de páginas disponíveis */
+    uint32_t available_pages = vm_page_free_count + vm_page_speculative_count;
+    memorystatus_update_available_page_count(available_pages);
+    
+    /* Acorda a thread do Jetsam */
+    memorystatus_thread_wake();
+}
+
+/*
+ * Retorna a string descritiva para uma causa de kill
+ */
+const char *
+memorystatus_get_cause_name(uint32_t cause)
+{
+    if (cause > 0 && cause < (sizeof(memstat_kill_cause_name) / sizeof(const char *))) {
+        return memstat_kill_cause_name[cause];
+    }
+    return "unknown-cause";
+}
+
+/*
+ * Retorna a prioridade Jetsam efetiva de um processo
+ */
+int
+memorystatus_get_effective_priority(pid_t pid)
+{
+    proc_t p;
+    int priority = -1;
+    
+    p = proc_find(pid);
+    if (p) {
+        priority = p->p_memstat_effectivepriority;
+        proc_rele(p);
+    }
+    
+    return priority;
+}
+
+
 /*
  * Callback invoked when allowable physical memory footprint exceeded
  * (dirty pages + IOKit mappings)
@@ -5092,6 +6076,8 @@ memorystatus_thread(void *param __unused, wait_result_t wr __unused)
  * This is invoked for both advisory, non-fatal per-task high watermarks,
  * as well as the fatal task memory limits.
  */
+
+
 void
 memorystatus_on_ledger_footprint_exceeded(boolean_t warning, boolean_t memlimit_is_active, boolean_t memlimit_is_fatal)
 {
