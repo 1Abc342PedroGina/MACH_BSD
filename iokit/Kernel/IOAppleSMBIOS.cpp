@@ -39,7 +39,7 @@
  */
 
 #ifdef __x86_64_
-_
+
 #include <IOKit/IOService.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IOKitKeys.h>
