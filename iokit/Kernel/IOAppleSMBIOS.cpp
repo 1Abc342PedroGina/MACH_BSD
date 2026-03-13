@@ -1485,3 +1485,5 @@ static void apple_smbios_destructor(void)
 {
     printf("AppleSMBIOS: Destructor\n");
 }
+
+#endif /* __x86_64__ */
